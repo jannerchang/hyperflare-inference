@@ -44,28 +44,33 @@ impl ToolDialect for ArgumentTags {
             .and_then(|parameters| parameters.get("properties"))
             .and_then(Value::as_object);
         let mut arguments = Map::new();
-        while !rest.trim().is_empty() {
-            let key = rest
-                .trim_start()
-                .strip_prefix("<arg_key>")
-                .ok_or("GLM tool call requires an argument key")?;
-            let (key, tail) = key
-                .split_once("</arg_key>")
-                .ok_or("unterminated GLM argument key")?;
-            if key.is_empty() || arguments.contains_key(key) {
-                return Err("GLM argument names must be nonempty and unique".into());
+        loop {
+            // Lenient: generated calls can carry stray prose, JSON bodies, or
+            // misplaced tags between argument pairs. Scan for the next argument
+            // key rather than requiring one at the cursor, and keep any pairs
+            // already read instead of aborting the call.
+            let Some(at) = rest.find("<arg_key>") else {
+                break;
+            };
+            rest = &rest[at + "<arg_key>".len()..];
+            let Some((key, after_key)) = rest.split_once("</arg_key>") else {
+                break;
+            };
+            let key = key.trim();
+            // A value marker must follow the key; anything else means this
+            // pair is malformed, so skip to the next key or the call's end.
+            let after = after_key.trim_start();
+            if key.is_empty() || !after.starts_with("<arg_value>") {
+                rest = after_key;
+                continue;
             }
-            let value = tail
-                .trim_start()
-                .strip_prefix("<arg_value>")
-                .ok_or("GLM argument requires a value tag")?;
-            let (value, tail) = value
-                .split_once("</arg_value>")
-                .ok_or("unterminated GLM argument value")?;
-            arguments.insert(
-                key.to_owned(),
-                parameter_value(value, properties.and_then(|p| p.get(key)))?,
-            );
+            let value_rest = &after["<arg_value>".len()..];
+            let Some((value, tail)) = value_rest.split_once("</arg_value>") else {
+                break;
+            };
+            let converted = parameter_value(value, properties.and_then(|p| p.get(key)))?;
+            // Duplicate keys keep the first occurrence; later ones are ignored.
+            arguments.entry(key.to_owned()).or_insert(converted);
             rest = tail;
         }
         Ok(vec![(
@@ -183,17 +188,41 @@ mod tests {
 
     #[test]
     fn malformed_calls_fail() {
-        for body in [
-            "",
-            "run<arg_key></arg_key><arg_value>x</arg_value>",
-            "run<arg_key>text</arg_key><arg_value>a</arg_value><arg_key>text</arg_key><arg_value>b</arg_value>",
-            "run<arg_key>text</arg_key><arg_value>unfinished",
-            "run<arg_key>x</arg_key>text",
-        ] {
+        for body in [""] {
             assert!(
                 ArgumentTags::parse(body, &config().tools).is_err(),
                 "{body}"
             );
+        }
+    }
+
+    #[test]
+    fn lenient_calls_keep_valid_arguments() {
+        for (body, expected) in [
+            // Empty key skipped, no arguments remain.
+            ("run<arg_key></arg_key><arg_value>x</arg_value>", "{}"),
+            // Duplicate keys keep the first occurrence.
+            (
+                "run<arg_key>text</arg_key><arg_value>a</arg_value><arg_key>text</arg_key><arg_value>b</arg_value>",
+                r#"{"text":"a"}"#,
+            ),
+            // Unterminated trailing pair is dropped; the call still completes.
+            ("run<arg_key>text</arg_key><arg_value>unfinished", "{}"),
+            // A key without a value tag is skipped.
+            ("run<arg_key>x</arg_key>text", "{}"),
+            // Stray prose between name and keys is ignored.
+            (
+                "run extra words<arg_key>text</arg_key><arg_value>x</arg_value>",
+                r#"{"text":"x"}"#,
+            ),
+            // Stray content between pairs is ignored.
+            (
+                "run<arg_key>text</arg_key><arg_value>x</arg_value>oops<arg_key>count</arg_key><arg_value>2</arg_value>",
+                r#"{"text":"x","count":2}"#,
+            ),
+        ] {
+            let parsed = ArgumentTags::parse(body, &config().tools).unwrap();
+            assert_eq!(parsed[0].1, expected, "{body}");
         }
     }
 
