@@ -70,6 +70,30 @@ impl Configuration {
                 if run.scheduler_checkpoint_extra_work_fraction.is_none() {
                     run.scheduler_checkpoint_extra_work_fraction = self.server.scheduler_checkpoint_extra_work_fraction;
                 }
+                if run.sampling_defaults.default_temperature.is_none() {
+                    run.sampling_defaults.default_temperature = self.sampling.temperature;
+                }
+                if run.sampling_defaults.default_top_p.is_none() {
+                    run.sampling_defaults.default_top_p = self.sampling.top_p;
+                }
+                if run.sampling_defaults.default_top_k.is_none() {
+                    run.sampling_defaults.default_top_k = self.sampling.top_k;
+                }
+                if run.sampling_defaults.default_min_p.is_none() {
+                    run.sampling_defaults.default_min_p = self.sampling.min_p;
+                }
+                if run.sampling_defaults.default_repetition_penalty.is_none() {
+                    run.sampling_defaults.default_repetition_penalty =
+                        self.sampling.repetition_penalty;
+                }
+                if run.sampling_defaults.default_presence_penalty.is_none() {
+                    run.sampling_defaults.default_presence_penalty =
+                        self.sampling.presence_penalty;
+                }
+                if run.sampling_defaults.default_frequency_penalty.is_none() {
+                    run.sampling_defaults.default_frequency_penalty =
+                        self.sampling.frequency_penalty;
+                }
                 let serving = &mut run.serving;
                 if serving.memory_limit.is_none() {
                     serving.memory_limit = size(self.memory.reserve.as_deref(), "memory.reserve")?
@@ -713,6 +737,64 @@ namespace = "publisher"
         }
         for invalid in ["on", "0", "-1s", "NaN", "2d"] {
             assert!(Configuration::parse(&format!("[prefix_cache]\nmax_age='{invalid}'")).is_err());
+        }
+    }
+
+    #[test]
+    fn sampling_defaults_configuration_and_flag_precedence() {
+        let (_, empty) = configured("", &["flare", "run", "model.safetensors"], &[]);
+        assert_eq!(empty.sampling_defaults, cli::SamplingDefaultsArgs::default());
+
+        let text = r#"
+[sampling]
+temperature = 0.8
+top_p = 0.92
+top_k = 40
+min_p = 0.02
+repetition_penalty = 1.05
+presence_penalty = 0.0
+frequency_penalty = 0.0
+"#;
+        let (_, from_file) = configured(text, &["flare", "run", "model.safetensors"], &[]);
+        assert_eq!(from_file.sampling_defaults.default_temperature, Some(0.8));
+        assert_eq!(from_file.sampling_defaults.default_top_p, Some(0.92));
+        assert_eq!(from_file.sampling_defaults.default_top_k, Some(40));
+        assert_eq!(from_file.sampling_defaults.default_min_p, Some(0.02));
+        assert_eq!(
+            from_file.sampling_defaults.default_repetition_penalty,
+            Some(1.05)
+        );
+        assert_eq!(from_file.sampling_defaults.default_presence_penalty, Some(0.0));
+        assert_eq!(from_file.sampling_defaults.default_frequency_penalty, Some(0.0));
+
+        let (_, with_cli) = configured(
+            text,
+            &[
+                "flare",
+                "run",
+                "model.safetensors",
+                "--default-temperature",
+                "0.95",
+                "--default-top-k",
+                "-1",
+            ],
+            &[],
+        );
+        assert_eq!(with_cli.sampling_defaults.default_temperature, Some(0.95));
+        assert_eq!(with_cli.sampling_defaults.default_top_p, Some(0.92));
+        assert_eq!(with_cli.sampling_defaults.default_top_k, Some(-1));
+
+        for bad in [
+            "[sampling]\ntemperature = 0.0",
+            "[sampling]\ntop_p = 1.5",
+            "[sampling]\ntop_p = 0.0",
+            "[sampling]\nmin_p = -0.1",
+            "[sampling]\nmin_p = 1.2",
+            "[sampling]\nrepetition_penalty = 0.0",
+            "[sampling]\ntop_k = -2",
+            "[sampling]\nunknown_key = 1.0",
+        ] {
+            assert!(Configuration::parse(bad).is_err(), "{bad}");
         }
     }
 }

@@ -291,6 +291,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     config["api_key"] = key.into();
     config["thinking_token_budget"] = serde_json::json!(configuration.thinking_token_budget());
+    apply_sampling_overrides(&mut config, &args.sampling_defaults)?;
     phase.finish(config["model_id"].as_str().unwrap_or_default());
     serve(owner, config, progress, cluster, routing)?;
     #[cfg(unix)]
@@ -671,6 +672,144 @@ fn serve_local(
     Ok(())
 }
 
+fn apply_sampling_overrides(
+    config: &mut serde_json::Value,
+    defaults: &crate::cli::SamplingDefaultsArgs,
+) -> Result<(), String> {
+    if *defaults == crate::cli::SamplingDefaultsArgs::default() {
+        return Ok(());
+    }
+    if let Some(value) = defaults.default_temperature
+        && (!value.is_finite() || value < f32::MIN_POSITIVE)
+    {
+        return Err("default-temperature must be finite and greater than zero".into());
+    }
+    if let Some(value) = defaults.default_top_p
+        && (!value.is_finite() || value < f32::MIN_POSITIVE || value > 1.0)
+    {
+        return Err("default-top-p must be finite and in (0, 1]".into());
+    }
+    if let Some(value) = defaults.default_min_p
+        && (!value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return Err("default-min-p must be finite and in [0, 1]".into());
+    }
+    if let Some(value) = defaults.default_repetition_penalty
+        && (!value.is_finite() || value < f32::MIN_POSITIVE)
+    {
+        return Err("default-repetition-penalty must be finite and greater than zero".into());
+    }
+    if let Some(value) = defaults.default_presence_penalty
+        && !value.is_finite()
+    {
+        return Err("default-presence-penalty must be finite".into());
+    }
+    if let Some(value) = defaults.default_frequency_penalty
+        && !value.is_finite()
+    {
+        return Err("default-frequency-penalty must be finite".into());
+    }
+    if let Some(value) = defaults.default_top_k
+        && value < -1
+    {
+        return Err("default-top-k must be -1 or a nonnegative integer".into());
+    }
+
+    let sampling = config
+        .get_mut("sampling_defaults")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| "prepared core lacks sampling_defaults".to_owned())?;
+    if !sampling.get("ranges").is_some_and(serde_json::Value::is_object) {
+        sampling.insert("ranges".into(), serde_json::json!({}));
+    }
+    let Some(mut ranges_value) = sampling.remove("ranges") else {
+        unreachable!();
+    };
+    {
+        let ranges = ranges_value
+            .as_object_mut()
+            .ok_or_else(|| "sampling_defaults.ranges must be an object".to_owned())?;
+        for (name, override_value) in [
+            ("temperature", defaults.default_temperature),
+            ("top_p", defaults.default_top_p),
+            ("min_p", defaults.default_min_p),
+            ("repetition_penalty", defaults.default_repetition_penalty),
+            ("presence_penalty", defaults.default_presence_penalty),
+            ("frequency_penalty", defaults.default_frequency_penalty),
+        ] {
+            if let Some(value) = override_value {
+                override_f32_sampling(sampling, ranges, name, value)?;
+            }
+        }
+        if let Some(value) = defaults.default_top_k {
+            override_i32_sampling(sampling, ranges, "top_k", value)?;
+        }
+    }
+    sampling.insert("ranges".into(), ranges_value);
+    Ok(())
+}
+
+fn override_f32_sampling(
+    sampling: &mut serde_json::Map<String, serde_json::Value>,
+    ranges: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    value: f32,
+) -> Result<(), String> {
+    let old_value = sampling
+        .get(name)
+        .cloned()
+        .ok_or_else(|| format!("core sampling_defaults.{name} is missing"))?;
+    let old_num = old_value
+        .as_f64()
+        .ok_or_else(|| format!("core sampling_defaults.{name} must be numeric"))?;
+    let val_num = f64::from(value);
+    let new_value = serde_json::json!(value);
+    let range = ranges.get(name).and_then(serde_json::Value::as_object);
+    let existing_min = range.and_then(|r| r.get("min"));
+    let existing_max = range.and_then(|r| r.get("max"));
+    let min_val = match existing_min.and_then(serde_json::Value::as_f64) {
+        Some(cur) if cur <= val_num => existing_min.unwrap().clone(),
+        Some(_) => new_value.clone(),
+        None => if old_num <= val_num { old_value.clone() } else { new_value.clone() },
+    };
+    let max_val = match existing_max.and_then(serde_json::Value::as_f64) {
+        Some(cur) if cur >= val_num => existing_max.unwrap().clone(),
+        Some(_) => new_value.clone(),
+        None => if old_num >= val_num { old_value } else { new_value.clone() },
+    };
+    sampling.insert(name.into(), new_value);
+    ranges.insert(name.into(), serde_json::json!({ "min": min_val, "max": max_val }));
+    Ok(())
+}
+
+fn override_i32_sampling(
+    sampling: &mut serde_json::Map<String, serde_json::Value>,
+    ranges: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    value: i32,
+) -> Result<(), String> {
+    let old_num = sampling
+        .get(name)
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| format!("core sampling_defaults.{name} must be an integer"))?;
+    let val_num = i64::from(value);
+    let range = ranges.get(name).and_then(serde_json::Value::as_object);
+    let cur_min = range
+        .and_then(|r| r.get("min"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(old_num);
+    let cur_max = range
+        .and_then(|r| r.get("max"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(old_num);
+    sampling.insert(name.into(), serde_json::json!(value));
+    ranges.insert(
+        name.into(),
+        serde_json::json!({ "min": cur_min.min(val_num), "max": cur_max.max(val_num) }),
+    );
+    Ok(())
+}
+
 #[cfg(windows)]
 unsafe extern "system" fn stop_console(event: u32) -> i32 {
     use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
@@ -872,5 +1011,66 @@ mod tests {
         );
         // The failed load dropped its entry lease, so eviction is possible.
         store.evict(&key, &entry_id).unwrap();
+    }
+
+    #[test]
+    fn apply_sampling_overrides_updates_defaults_and_widens_ranges() {
+        let mut base = serde_json::json!({
+            "sampling_defaults": {
+                "seed": 0,
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": -1,
+                "min_p": 0.0,
+                "repetition_penalty": 1.0,
+                "presence_penalty": 0.0,
+                "frequency_penalty": 0.0,
+                "ranges": {
+                    "temperature": { "min": 0.95, "max": 1.0 },
+                    "top_p": { "min": 0.95, "max": 1.0 }
+                }
+            }
+        });
+
+        let unchanged = base.clone();
+        super::apply_sampling_overrides(&mut base, &crate::cli::SamplingDefaultsArgs::default())
+            .unwrap();
+        assert_eq!(base, unchanged);
+
+        let overrides = crate::cli::SamplingDefaultsArgs {
+            default_temperature: Some(0.8),
+            default_top_p: Some(0.92),
+            default_top_k: Some(64),
+            default_min_p: Some(0.02),
+            default_repetition_penalty: Some(1.05),
+            default_presence_penalty: None,
+            default_frequency_penalty: None,
+        };
+        super::apply_sampling_overrides(&mut base, &overrides).unwrap();
+
+        let defaults = &base["sampling_defaults"];
+        assert!((defaults["temperature"].as_f64().unwrap() - 0.8).abs() < 1e-6);
+        assert!((defaults["top_p"].as_f64().unwrap() - 0.92).abs() < 1e-6);
+        assert_eq!(defaults["top_k"].as_i64(), Some(64));
+        assert!((defaults["min_p"].as_f64().unwrap() - 0.02).abs() < 1e-6);
+        assert!((defaults["repetition_penalty"].as_f64().unwrap() - 1.05).abs() < 1e-6);
+
+        let ranges = &defaults["ranges"];
+        assert!((ranges["temperature"]["min"].as_f64().unwrap() - 0.8).abs() < 1e-6);
+        assert_eq!(ranges["temperature"]["max"].as_f64(), Some(1.0));
+        assert!((ranges["top_p"]["min"].as_f64().unwrap() - 0.92).abs() < 1e-6);
+        assert_eq!(ranges["top_p"]["max"].as_f64(), Some(1.0));
+        assert_eq!(ranges["top_k"]["min"].as_i64(), Some(-1));
+        assert_eq!(ranges["top_k"]["max"].as_i64(), Some(64));
+        assert_eq!(ranges["min_p"]["min"].as_f64(), Some(0.0));
+        assert!((ranges["min_p"]["max"].as_f64().unwrap() - 0.02).abs() < 1e-6);
+        assert_eq!(ranges["repetition_penalty"]["min"].as_f64(), Some(1.0));
+        assert!((ranges["repetition_penalty"]["max"].as_f64().unwrap() - 1.05).abs() < 1e-6);
+
+        let invalid = crate::cli::SamplingDefaultsArgs {
+            default_temperature: Some(0.0),
+            ..Default::default()
+        };
+        assert!(super::apply_sampling_overrides(&mut base, &invalid).is_err());
     }
 }

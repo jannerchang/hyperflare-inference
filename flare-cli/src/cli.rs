@@ -483,6 +483,7 @@ impl OrbitPush {
             scheduler_terminal_value: None,
             scheduler_terminal_age_price: None,
             scheduler_checkpoint_extra_work_fraction: None,
+            sampling_defaults: SamplingDefaultsArgs::default(),
             serving: self.serving.clone(),
         }
     }
@@ -667,6 +668,7 @@ impl OrbitRun {
             scheduler_terminal_value: self.scheduler_terminal_value,
             scheduler_terminal_age_price: self.scheduler_terminal_age_price,
             scheduler_checkpoint_extra_work_fraction: self.scheduler_checkpoint_extra_work_fraction,
+            sampling_defaults: SamplingDefaultsArgs::default(),
             serving: self.serving.clone(),
         }
     }
@@ -794,7 +796,44 @@ pub struct Run {
     pub scheduler_checkpoint_extra_work_fraction: Option<f64>,
 
     #[command(flatten)]
+    pub sampling_defaults: SamplingDefaultsArgs,
+
+    #[command(flatten)]
     pub serving: ServingOptions,
+}
+
+/// Optional server-side sampling default overrides; omitted fields preserve the core's defaults.
+/// Overriding a fixed parameter automatically widens its allowed range to span the core default
+/// and configured value.
+#[derive(Debug, Args, Clone, Default, PartialEq)]
+pub struct SamplingDefaultsArgs {
+    /// Override default sampling temperature for requests that omit it.
+    #[arg(long, value_name = "FLOAT", value_parser = positive_normal_f32, help_heading = "Sampling defaults")]
+    pub default_temperature: Option<f32>,
+
+    /// Override default top-p nucleus threshold (0, 1] for requests that omit it.
+    #[arg(long, value_name = "FLOAT", value_parser = top_p_f32, help_heading = "Sampling defaults")]
+    pub default_top_p: Option<f32>,
+
+    /// Override default top-k (-1 disables) for requests that omit it.
+    #[arg(long, value_name = "INT", allow_hyphen_values = true, value_parser = top_k_i32, help_heading = "Sampling defaults")]
+    pub default_top_k: Option<i32>,
+
+    /// Override default min-p [0, 1] for requests that omit it.
+    #[arg(long, value_name = "FLOAT", value_parser = min_p_f32, help_heading = "Sampling defaults")]
+    pub default_min_p: Option<f32>,
+
+    /// Override default repetition penalty (> 0) for requests that omit it.
+    #[arg(long, value_name = "FLOAT", value_parser = positive_normal_f32, help_heading = "Sampling defaults")]
+    pub default_repetition_penalty: Option<f32>,
+
+    /// Override default presence penalty for requests that omit it.
+    #[arg(long, value_name = "FLOAT", allow_hyphen_values = true, value_parser = finite_f32, help_heading = "Sampling defaults")]
+    pub default_presence_penalty: Option<f32>,
+
+    /// Override default frequency penalty for requests that omit it.
+    #[arg(long, value_name = "FLOAT", allow_hyphen_values = true, value_parser = finite_f32, help_heading = "Sampling defaults")]
+    pub default_frequency_penalty: Option<f32>,
 }
 
 /// Options that select a core's trust, loading, speculation and caching; every rank of a
@@ -1024,6 +1063,46 @@ fn verification_alpha(value: &str) -> Result<f64, String> {
         .ok()
         .filter(|v| v.is_finite() && *v > 0.0)
         .ok_or_else(|| "adaptive verification alpha must be finite and greater than zero".into())
+}
+
+fn positive_normal_f32(value: &str) -> Result<f32, String> {
+    value
+        .parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= f32::MIN_POSITIVE)
+        .ok_or_else(|| "value must be a finite number greater than zero".into())
+}
+
+fn top_p_f32(value: &str) -> Result<f32, String> {
+    value
+        .parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= f32::MIN_POSITIVE && *v <= 1.0)
+        .ok_or_else(|| "top-p must be finite and in (0, 1]".into())
+}
+
+fn min_p_f32(value: &str) -> Result<f32, String> {
+    value
+        .parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        .ok_or_else(|| "min-p must be finite and in [0, 1]".into())
+}
+
+fn finite_f32(value: &str) -> Result<f32, String> {
+    value
+        .parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| "penalty must be a finite number".into())
+}
+
+fn top_k_i32(value: &str) -> Result<i32, String> {
+    value
+        .parse::<i32>()
+        .ok()
+        .filter(|v| *v >= -1)
+        .ok_or_else(|| "top-k must be -1 or a nonnegative integer".into())
 }
 
 impl std::ops::Deref for Run {
@@ -2257,6 +2336,60 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn default_sampling_flags_parse_and_validate_bounds() {
+        let parsed = run(&[
+            "flare",
+            "run",
+            "model.safetensors",
+            "--default-temperature",
+            "0.8",
+            "--default-top-p",
+            "0.92",
+            "--default-top-k",
+            "-1",
+            "--default-min-p",
+            "0.02",
+            "--default-repetition-penalty",
+            "1.05",
+            "--default-presence-penalty",
+            "-0.5",
+            "--default-frequency-penalty",
+            "0",
+        ]);
+        assert_eq!(parsed.sampling_defaults.default_temperature, Some(0.8));
+        assert_eq!(parsed.sampling_defaults.default_top_p, Some(0.92));
+        assert_eq!(parsed.sampling_defaults.default_top_k, Some(-1));
+        assert_eq!(parsed.sampling_defaults.default_min_p, Some(0.02));
+        assert_eq!(parsed.sampling_defaults.default_repetition_penalty, Some(1.05));
+        assert_eq!(parsed.sampling_defaults.default_presence_penalty, Some(-0.5));
+        assert_eq!(parsed.sampling_defaults.default_frequency_penalty, Some(0.0));
+
+        for invalid in [
+            ["--default-temperature", "0"],
+            ["--default-temperature", "-1"],
+            ["--default-top-p", "0"],
+            ["--default-top-p", "1.1"],
+            ["--default-top-k", "-2"],
+            ["--default-min-p", "-0.1"],
+            ["--default-min-p", "1.1"],
+            ["--default-repetition-penalty", "0"],
+            ["--default-presence-penalty", "NaN"],
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "flare",
+                    "run",
+                    "model.safetensors",
+                    invalid[0],
+                    invalid[1],
+                ])
+                .is_err(),
+                "{invalid:?}"
+            );
+        }
     }
 }
 

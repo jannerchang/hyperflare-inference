@@ -15,10 +15,64 @@ type Failure = Box<dyn std::error::Error + Send + Sync>;
 pub struct Configuration {
     pub server: Server,
     pub defaults: Model,
+    pub sampling: Sampling,
     pub models: HashMap<String, Model>,
     pub memory: Memory,
     pub prefix_cache: PrefixCache,
     pub paths: Paths,
+}
+
+#[derive(Default, Deserialize, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Sampling {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<i32>,
+    pub min_p: Option<f32>,
+    pub repetition_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+}
+
+impl Sampling {
+    pub fn validate(&self) -> Result<(), Failure> {
+        if let Some(value) = self.temperature
+            && (!value.is_finite() || value < f32::MIN_POSITIVE)
+        {
+            return Err("sampling.temperature must be finite and greater than zero".into());
+        }
+        if let Some(value) = self.top_p
+            && (!value.is_finite() || value < f32::MIN_POSITIVE || value > 1.0)
+        {
+            return Err("sampling.top_p must be finite and in (0, 1]".into());
+        }
+        if let Some(value) = self.min_p
+            && (!value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            return Err("sampling.min_p must be finite and in [0, 1]".into());
+        }
+        if let Some(value) = self.repetition_penalty
+            && (!value.is_finite() || value < f32::MIN_POSITIVE)
+        {
+            return Err("sampling.repetition_penalty must be finite and greater than zero".into());
+        }
+        if let Some(value) = self.presence_penalty
+            && !value.is_finite()
+        {
+            return Err("sampling.presence_penalty must be finite".into());
+        }
+        if let Some(value) = self.frequency_penalty
+            && !value.is_finite()
+        {
+            return Err("sampling.frequency_penalty must be finite".into());
+        }
+        if let Some(value) = self.top_k
+            && value < -1
+        {
+            return Err("sampling.top_k must be -1 or a nonnegative integer".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -95,6 +149,7 @@ impl Configuration {
         if let Some(value) = nonempty(configuration.prefix_cache.max_age.as_deref()) {
             parse_max_age(value).map_err(|error| format!("prefix_cache.max_age: {error}"))?;
         }
+        configuration.sampling.validate()?;
         Ok(configuration)
     }
 
