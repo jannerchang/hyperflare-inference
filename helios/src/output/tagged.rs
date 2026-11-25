@@ -35,6 +35,9 @@ pub trait ToolDialect {
     const CLOSE: &'static str;
     const FUNCTION: Option<(&'static str, &'static str)> = None;
     const TOOL_ENDS_REASONING: bool = false;
+    /// When true, an unclosed tool call reaching normal EOS still attempts
+    /// lenient parsing instead of aborting the whole response.
+    const LENIENT_EOS_CLOSE: bool = false;
     fn parse(body: &str, tools: &[Value]) -> Result<Vec<(String, String)>>;
     /// Whether text beginning with `OPEN` or the function opener starts a call
     /// rather than mentioning the tag in prose; `None` until more text decides.
@@ -268,6 +271,32 @@ impl<D: ToolDialect> ToolCallParser for TaggedTools<D> {
         ) {
             self.buffer.clear();
             return Ok(vec![]);
+        }
+        if cause == Termination::Eos && D::LENIENT_EOS_CLOSE {
+            let raw = std::mem::take(&mut self.buffer);
+            if let Ok(calls) = D::parse(&raw, &self.tools)
+                && !calls.is_empty()
+            {
+                return Ok(calls
+                    .into_iter()
+                    .enumerate()
+                    .flat_map(|(offset, (name, arguments))| {
+                        let index = self.index + offset;
+                        [
+                            Event::ToolBegin {
+                                index,
+                                name,
+                                id: None,
+                            },
+                            Event::ToolArguments {
+                                index,
+                                text: arguments,
+                            },
+                            Event::ToolEnd { index },
+                        ]
+                    })
+                    .collect());
+            }
         }
         Err(format!("incomplete {} tool call", D::NAME).into())
     }

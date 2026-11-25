@@ -26,6 +26,7 @@ impl ToolDialect for ArgumentTags {
     const TRIM_NEWLINES: bool = false;
     const OPEN: &'static str = "<tool_call>";
     const CLOSE: &'static str = "</tool_call>";
+    const LENIENT_EOS_CLOSE: bool = true;
 
     fn parse(body: &str, tools: &[Value]) -> Result<Vec<(String, String)>> {
         let body = body.trim();
@@ -350,5 +351,36 @@ mod tests {
                 "<think>{\"x\":1}</think>".into()
             )]
         );
+    }
+
+    #[test]
+    fn unclosed_glm_tool_call_at_eos_emits_parsed_call() {
+        // Missing closing </tool_call> before normal EOS should recover the
+        // parsed call instead of failing with "incomplete GLM tool call".
+        let mut parser = ArgumentTagOutput::new(config());
+        let mut output = Accumulator::new("eos-unclosed".into());
+        output
+            .apply(
+                parser
+                    .push(Input::Text(
+                        "</think><tool_call>run<arg_key>text</arg_key><arg_value>ok</arg_value>",
+                    ))
+                    .unwrap(),
+            )
+            .unwrap();
+        output
+            .apply(parser.finish(Termination::Eos).unwrap())
+            .unwrap();
+        output.finish().unwrap();
+        let message = output.message();
+        let calls = message["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "run");
+        assert_eq!(calls[0]["function"]["arguments"], r#"{"text":"ok"}"#);
+
+        // An empty <tool_call> with no function name still fails at EOS.
+        let mut empty = ArgumentTagOutput::new(config());
+        empty.push(Input::Text("</think><tool_call>   ")).unwrap();
+        assert!(empty.finish(Termination::Eos).is_err());
     }
 }
