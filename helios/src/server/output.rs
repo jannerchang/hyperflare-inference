@@ -144,6 +144,7 @@ impl Accumulator {
 }
 
 pub(super) struct Decoder<'a, P: ModelOutput> {
+    frontend: &'a Frontend,
     decoder: IncrementalDecoder<'a>,
     tracking: Option<super::token_spans::TokenSpans<'a>>,
     attribute_content: bool,
@@ -170,6 +171,7 @@ impl Decoder<'_, crate::output::OutputPipeline> {
 impl<'a, P: ModelOutput> Decoder<'a, P> {
     pub fn new(frontend: &'a Frontend, eos: &'a [u32], config: Option<P::Config>) -> Self {
         Self {
+            frontend,
             decoder: frontend.incremental_decoder(false),
             tracking: None,
             attribute_content: false,
@@ -199,10 +201,10 @@ impl<'a, P: ModelOutput> Decoder<'a, P> {
         if self.finished || self.worker_decoded { return Err("invalid token decoding state".into()); }
         self.local_decoded = true;
         let token = value.token;
-        let is_end_of_turn = self.eos.contains(&token);
+        let is_silent = self.eos.contains(&token) || self.frontend.is_silent_output_token(token);
         let mut events = self.parse(Input::Token(token))?;
         let tracking = self.tracking.as_mut().ok_or("logprob decoder was not initialized")?;
-        if is_end_of_turn {
+        if is_silent {
             if let Some(span) = tracking.silent(token, Some(value)) {
                 self.entries(span.tokens.into_iter().filter_map(|t| t.logprob));
                 events.extend(self.parse(Input::Text(""))?);
@@ -211,7 +213,7 @@ impl<'a, P: ModelOutput> Decoder<'a, P> {
             self.entries(span.tokens.into_iter().filter_map(|t| t.logprob));
             events.extend(self.parse(Input::Text(&span.text))?);
         }
-        self.attribute(u32::from(!is_end_of_turn), &events);
+        self.attribute(u32::from(!is_silent), &events);
         Ok(events)
     }
     pub fn push(&mut self, token: u32) -> Result<Vec<Event>> {
@@ -222,9 +224,9 @@ impl<'a, P: ModelOutput> Decoder<'a, P> {
             return Err("cannot mix worker-decoded protocol pieces with token decoding".into());
         }
         self.local_decoded = true;
-        let is_end_of_turn = self.eos.contains(&token);
+        let is_silent = self.eos.contains(&token) || self.frontend.is_silent_output_token(token);
         let mut events = self.parse(Input::Token(token))?;
-        if !is_end_of_turn {
+        if !is_silent {
             if let Some(tracking) = &mut self.tracking {
                 if let Some(span) = tracking.push(token, None)? {
                     self.entries(span.tokens.into_iter().filter_map(|token| token.logprob));
@@ -234,9 +236,9 @@ impl<'a, P: ModelOutput> Decoder<'a, P> {
                 events.extend(self.parse(Input::Text(&text))?);
             }
         }
-        // The end-of-turn token publishes nothing in any region, so it stays
-        // out of the pool that a withheld span later joins.
-        self.attribute(u32::from(!is_end_of_turn), &events);
+        // End-of-turn and prompt-only special tokens publish nothing in any
+        // region, so they stay out of the pool that a withheld span later joins.
+        self.attribute(u32::from(!is_silent), &events);
         Ok(events)
     }
     pub fn push_protocol(&mut self, pieces: Vec<crate::output::Piece>) -> Result<Vec<Event>> {
@@ -1511,5 +1513,130 @@ mod logprob_retention_tests {
             assert_eq!(decoder.pending_entries.is_empty(), index >= 2);
         }
         assert!(decoder.finish(Termination::OutputLimit).unwrap().is_empty());
+    }
+
+    #[test]
+    fn prompt_only_special_tokens_are_suppressed_from_reasoning_and_content() {
+        use crate::frontend::{Asset, FrontendAssets};
+        use sha2::{Digest, Sha256};
+
+        let root = std::env::temp_dir().join(format!(
+            "flare-output-silent-special-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pieces = ["Now", "plan", "answer"];
+        let vocab: tokenizers::models::bpe::Vocab = pieces
+            .iter()
+            .enumerate()
+            .map(|(i, s)| ((*s).to_owned(), i as u32))
+            .collect();
+        let model = tokenizers::models::bpe::BPE::builder()
+            .vocab_and_merges(vocab, vec![])
+            .build()
+            .unwrap();
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer.with_decoder(Some(tokenizers::decoders::sequence::Sequence::new(vec![
+            tokenizers::decoders::byte_fallback::ByteFallback::default().into(),
+            tokenizers::decoders::fuse::Fuse::default().into(),
+        ])));
+        tokenizer
+            .add_special_tokens([
+                tokenizers::AddedToken::from("[gMASK]", true),
+                tokenizers::AddedToken::from("<sop>", true),
+            ])
+            .unwrap();
+        tokenizer
+            .add_tokens([tokenizers::AddedToken::from("</think>", false)])
+            .unwrap();
+        let gmask = tokenizer.token_to_id("[gMASK]").unwrap();
+        let sop = tokenizer.token_to_id("<sop>").unwrap();
+        let close = tokenizer.token_to_id("</think>").unwrap();
+
+        let asset = |name: &str, bytes: &[u8]| {
+            let path = root.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            Asset {
+                range: None,
+                path,
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+            }
+        };
+        let frontend = Frontend::load(
+            FrontendAssets {
+                tokenizer: asset(
+                    "tokenizer.json",
+                    tokenizer.to_string(false).unwrap().as_bytes(),
+                ),
+                tokens: Default::default(),
+                chat_template: Some(asset("chat_template.jinja", b"{% mark %}{{ messages[0].content }}")),
+            },
+            Default::default(),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let mut syntax = crate::model::testing::metadata().frontend;
+        syntax.reasoning = Some(crate::model::contract::ReasoningParser {
+            kind: crate::model::contract::ReasoningParserKind::ThinkTags,
+            open: "<think>".into(),
+            close: "</think>".into(),
+            wrapping_newlines: 0,
+            terminal_markers: vec![],
+        });
+        let config = OutputConfig {
+            syntax,
+            control_tokens: vec![(close, "</think>".into())],
+            content: Tags {
+                structured: false,
+                start: OutputStart::Reasoning,
+                tools: vec![],
+            },
+        };
+
+        // Plain streaming path (no logprobs).
+        let mut decoder = Decoder::<OutputPipeline>::new(&frontend, &[], Some(config.clone()));
+        let mut events = vec![];
+        for token in [0, gmask, gmask, 1, close, sop, 2] {
+            events.extend(decoder.push(token).unwrap());
+        }
+        events.extend(decoder.finish(Termination::OutputLimit).unwrap());
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        for event in &events {
+            match event {
+                Event::Reasoning(text) => reasoning.push_str(text),
+                Event::Content(text) => content.push_str(text),
+                _ => {}
+            }
+        }
+        assert_eq!(reasoning, "Nowplan");
+        assert_eq!(content, "answer");
+
+        // Logprob-tracking path preserves byte offsets while silencing [gMASK].
+        let mut tracked = Decoder::<OutputPipeline>::new(&frontend, &[], Some(config));
+        tracked.track_logprobs(&frontend, true);
+        let mut tracked_events = vec![];
+        for token in [0, gmask, 1, close, 2] {
+            tracked_events.extend(
+                tracked
+                    .push_logprob(TokenLogprobs {
+                        token,
+                        logprob: -1.,
+                        top: vec![],
+                    })
+                    .unwrap(),
+            );
+        }
+        tracked_events.extend(tracked.finish(Termination::OutputLimit).unwrap());
+        let (mut r2, mut c2) = (String::new(), String::new());
+        for event in &tracked_events {
+            match event {
+                Event::Reasoning(text) => r2.push_str(text),
+                Event::Content(text) => c2.push_str(text),
+                _ => {}
+            }
+        }
+        assert_eq!(r2, "Nowplan");
+        assert_eq!(c2, "answer");
     }
 }

@@ -141,6 +141,7 @@ struct Span {
 }
 
 pub(super) struct TextStops<'a> {
+    frontend: &'a crate::frontend::Frontend,
     decoder: crate::frontend::IncrementalDecoder<'a>,
     tracked: Option<super::token_spans::TokenSpans<'a>>,
     pending_entries: Vec<(usize, super::token_spans::ReturnedLogprob)>,
@@ -155,6 +156,7 @@ impl<'a> TextStops<'a> {
     }
     pub fn new(frontend: &'a crate::frontend::Frontend, strings: Vec<String>) -> Result<Self> {
         Ok(Self {
+            frontend,
             decoder: frontend.incremental_decoder(false),
             tracked: None,
             pending_entries: vec![],
@@ -162,6 +164,15 @@ impl<'a> TextStops<'a> {
             pending_tokens: Vec::new(),
             spans: std::collections::VecDeque::new(),
             visible_bytes: 0,
+        })
+    }
+    fn is_silent_token(&self, token: u32) -> bool {
+        if !self.frontend.is_silent_output_token(token) {
+            return false;
+        }
+        let spelling = self.frontend.tokenizer().id_to_token(token);
+        !spelling.as_deref().is_some_and(|text| {
+            self.stops.strings.iter().any(|stop| stop.contains(text))
         })
     }
     pub fn track(&mut self, frontend: &'a crate::frontend::Frontend) {
@@ -173,6 +184,7 @@ impl<'a> TextStops<'a> {
         value: crate::execution::TokenLogprobs,
         silent: bool,
     ) -> Result<(Vec<crate::output::Piece>, bool)> {
+        let silent = silent || self.is_silent_token(token);
         self.push_tracked(token, Some(value), silent)
     }
     fn push_tracked(
@@ -210,8 +222,12 @@ impl<'a> TextStops<'a> {
         self.accept_text(span.text, finish)
     }
     pub fn push(&mut self, token: u32) -> Result<(Vec<crate::output::Piece>, bool)> {
+        let silent = self.is_silent_token(token);
         if self.tracked.is_some() {
-            return self.push_tracked(token, None, false);
+            return self.push_tracked(token, None, silent);
+        }
+        if silent {
+            return Ok((vec![], false));
         }
         self.pending_tokens.push(token);
         let text = self.decoder.push(&[token])?;
@@ -514,5 +530,66 @@ pub(super) mod string_tests {
         }
         let mut stops = StringStops::new(vec!["bc".into(), "abc".into()]).unwrap();
         assert_eq!(stops.push("abc"), (String::new(), true));
+    }
+
+    #[test]
+    fn text_stops_suppresses_prompt_only_special_tokens_unless_explicitly_stopped() {
+        use crate::frontend::{Asset, Frontend, FrontendAssets};
+        use sha2::{Digest, Sha256};
+
+        let root = std::env::temp_dir().join(format!(
+            "flare-stops-silent-special-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let vocab: tokenizers::models::bpe::Vocab = [("Now".to_owned(), 0), ("ok".to_owned(), 1)]
+            .into_iter()
+            .collect();
+        let model = tokenizers::models::bpe::BPE::builder()
+            .vocab_and_merges(vocab, vec![])
+            .build()
+            .unwrap();
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer.with_decoder(Some(tokenizers::decoders::sequence::Sequence::new(vec![
+            tokenizers::decoders::byte_fallback::ByteFallback::default().into(),
+            tokenizers::decoders::fuse::Fuse::default().into(),
+        ])));
+        tokenizer
+            .add_special_tokens([tokenizers::AddedToken::from("[gMASK]", true)])
+            .unwrap();
+        let gmask = tokenizer.token_to_id("[gMASK]").unwrap();
+
+        let asset = |name: &str, bytes: &[u8]| {
+            let path = root.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            Asset {
+                range: None,
+                path,
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+            }
+        };
+        let frontend = Frontend::load(
+            FrontendAssets {
+                tokenizer: asset(
+                    "tokenizer.json",
+                    tokenizer.to_string(false).unwrap().as_bytes(),
+                ),
+                tokens: Default::default(),
+                chat_template: Some(asset("chat_template.jinja", b"{% mark %}{{ messages[0].content }}")),
+            },
+            Default::default(),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let mut stops = TextStops::new(&frontend, vec!["END".into()]).unwrap();
+        assert_eq!(push_text(&mut stops, 0), ("Now".into(), false));
+        assert_eq!(push_text(&mut stops, gmask), (String::new(), false));
+        assert_eq!(push_text(&mut stops, 1), ("ok".into(), false));
+        assert_eq!(finish_text(&mut stops), (String::new(), false));
+
+        let mut explicit = TextStops::new(&frontend, vec!["[gMASK]".into()]).unwrap();
+        assert_eq!(push_text(&mut explicit, 0), ("Now".into(), false));
+        assert_eq!(push_text(&mut explicit, gmask), (String::new(), true));
     }
 }
